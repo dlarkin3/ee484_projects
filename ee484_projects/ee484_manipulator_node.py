@@ -1451,7 +1451,7 @@ class IntegratedManipulatorNode(Node):
             self.cmd_vel_msg.twist.angular.z = self.desired_angular_vel
             self.cmd_vel_msg.twist.linear.y = 0.0; self.cmd_vel_msg.twist.linear.z = 0.0
             self.cmd_vel_msg.twist.angular.x = 0.0; self.cmd_vel_msg.twist.angular.y = 0.0
-            self.cmd_vel_pub_.publish(self.cmd_vel_msg)
+            # self.cmd_vel_pub_.publish(self.cmd_vel_msg)
         except Exception as e:
             self.get_logger().error(f"Failed immediate velocity publish: {e}", exc_info=True)
 
