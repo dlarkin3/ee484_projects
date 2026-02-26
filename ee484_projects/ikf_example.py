@@ -1,38 +1,29 @@
 #!/usr/bin/env python3
-import os
+
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
-import threading
 from rclpy.action import ActionClient
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from control_msgs.action import FollowJointTrajectory
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
 import numpy as np
+from math import cos, sin, pi, sqrt, atan2
+from ament_index_python.packages import get_package_share_directory
+import os
+from urdf_parser_py.urdf import URDF
+import traceback
+from control_msgs.action import GripperCommand
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from sensor_msgs.msg import JointState
+import time
 try:
     from scipy.signal import savgol_filter
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
-from math import cos, sin, pi, sqrt, atan2
-import traceback
-import time
-import json
 
-# ROS Messages and Actions
-from builtin_interfaces.msg import Duration
-from control_msgs.action import GripperCommand
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from geometry_msgs.msg import TwistStamped
-from std_msgs.msg import String
-from sensor_msgs.msg import JointState
 
-# URDF and Kinematics related imports
-from ament_index_python.packages import get_package_share_directory
-from urdf_parser_py.urdf import URDF
 
-# === SVG Parsing Imports ===
-import xml.etree.ElementTree as ET
-from svg.path import parse_path, Line, Arc, CubicBezier, QuadraticBezier
-import matplotlib.pyplot as plt # Keep for optional plotting
 
 # === Kinematics Functions  ===
 # --- START Kinematics Functions ---
@@ -622,99 +613,14 @@ def ik_solver(T_desired, initial_pose_angles, robot, base_link, tip_link, joint_
 # --- END Kinematics Functions ---
 
 
-# === SVG Parsing Functions ===
-def parse_svg_file_robust(svg_filename, num_segments=6):
-    if not os.path.exists(svg_filename): raise FileNotFoundError(f"SVG file not found: {svg_filename}")
-    try:
-        tree = ET.parse(svg_filename); root = tree.getroot()
-        all_paths_points = [] # List of lists, one per path
-        namespaces = {'svg': 'http://www.w3.org/2000/svg'}
-        paths = root.findall('.//svg:path', namespaces) or root.findall('.//path')
-        if not paths: print("Warning: No <path> elements found in SVG."); return [], []
-        print(f"Found {len(paths)} path elements.")
-        for i, path_element in enumerate(paths):
-            d = path_element.attrib.get('d')
-            if not d: print(f"Warning: Path {i+1} has no 'd' attribute."); continue
-            try:
-                path_obj = parse_path(d); current_path_points = []
-                for segment in path_obj:
-                    start_complex = segment.start
-                    if not current_path_points: # Add absolute start of the path
-                        current_path_points.append((start_complex.real, start_complex.imag))
-                    if isinstance(segment, Line):
-                        current_path_points.append((segment.end.real, segment.end.imag))
-                    elif isinstance(segment, (Arc, CubicBezier, QuadraticBezier)):
-                        for t_step in range(1, num_segments + 1):
-                            t = t_step / num_segments; point = segment.point(t)
-                            pt = (point.real, point.imag)
-                            # Avoid adding duplicate points if segment start/end coincide
-                            if not current_path_points or np.linalg.norm(np.array(pt) - np.array(current_path_points[-1])) > 1e-6:
-                                current_path_points.append(pt)
-                # Handle 'Z' close path command explicitly
-                if d.strip().upper().endswith('Z') and current_path_points:
-                    start_pt = current_path_points[0]
-                    if np.linalg.norm(np.array(current_path_points[-1]) - np.array(start_pt)) > 1e-6:
-                        current_path_points.append(start_pt)
-                if current_path_points:
-                    # print(f"Extracted {len(current_path_points)} points from path {i+1}.") # Less verbose
-                    all_paths_points.append(current_path_points)
-                else: print(f"Warning: No points extracted from path {i+1}.")
-            except Exception as e: print(f"Error parsing d for path {i+1}: {e}\n{traceback.format_exc()}")
-        flat_point_list = [pt for path in all_paths_points for pt in path]
-        print(f"SVG Parsing: Returning {len(flat_point_list)} total points across {len(all_paths_points)} paths.")
-        return flat_point_list, all_paths_points # Return flat list and list of lists
-    except Exception as e: print(f"SVG parsing failed: {e}\n{traceback.format_exc()}"); return [], []
-
-# --- Plotting Function [Optional Utility] ---
-def plot_svg_paths(list_of_paths, svg_filename):
-    if not list_of_paths: print("No paths to plot."); return
-    fig, ax = plt.subplots(figsize=(8, 8))
-    for i, path_points in enumerate(list_of_paths):
-        if len(path_points) > 1:
-            x_coords, y_coords = zip(*path_points) # More concise way to get coords
-            ax.plot(x_coords, y_coords, marker='.', markersize=3, linestyle='-', label=f'Path {i+1}')
-        elif len(path_points) == 1:
-            ax.scatter(path_points[0][0], path_points[0][1], marker='x', s=50, label=f'Path {i+1} (single point)')
-    ax.set_aspect('equal', adjustable='box'); ax.invert_yaxis()
-    ax.set_xlabel("X Coordinate"); ax.set_ylabel("Y Coordinate")
-    ax.set_title(f"Visualized Path(s) from {os.path.basename(svg_filename)}")
-    ax.grid(True); ax.legend()
-    plt.show() # NOTE: This blocks continued execution until closed!
-
-# --- Point Transformation Function ---
-def transform_points_to_arm_vertical_plane(points_2d, scale=0.001, x_offset=0.20,
-                                           y_offset=0.0, z_offset=0.15, center=True):
-    if not points_2d: return []
-    points_np = np.array(points_2d)
-    min_xy = points_np.min(axis=0); max_xy = points_np.max(axis=0)
-    size_xy = max_xy - min_xy
-    center_xy = min_xy + 0.5 * size_xy
-    points_3d = []
-    for x_svg, y_svg in points_2d:
-        X = x_offset
-        if center:
-            Y = -scale * (x_svg - center_xy[0]) + y_offset
-            Z = -scale * (y_svg - center_xy[1]) + z_offset
-        else:
-            Y = -scale * x_svg + y_offset
-            Z = -scale * y_svg + z_offset
-        points_3d.append((X, Y, Z))
-    print(f"SVG BBox Scaled: w={size_xy[0]*scale:.3f}m, h={size_xy[1]*scale:.3f}m")
-    if points_3d:
-        points_3d_np = np.array(points_3d)
-        min_YZ = points_3d_np[:, 1:].min(axis=0); max_YZ = points_3d_np[:, 1:].max(axis=0)
-        print(f"Transformed points approx: X={points_3d[0][0]:.3f}, Y=[{min_YZ[0]:.3f}, {max_YZ[0]:.3f}], Z=[{min_YZ[1]:.3f}, {max_YZ[1]:.3f}]")
-    return points_3d
 
 
-# === ROS 2 Node ===
-# [ Rest of the IntegratedManipulatorNode class definition ]
-class IntegratedManipulatorNode(Node):
+class ArmController(Node):
     def __init__(self):
-        super().__init__("integrated_manipulator_node")
-        package_name_for_node = 'robopicasso'
-
-        # --- Parameters ---
+        super().__init__('arm_controller')
+        package_name= 'ee484_projects'
+        self.joint_names = ['joint1', 'joint2', 'joint3', 'joint4']
+        self.points_file = os.path.join(get_package_share_directory(package_name), 'config', 'points.csv')
 
         # Motion Control Params
         self.declare_parameter("arm_controller_name", "arm_controller")
@@ -743,63 +649,24 @@ class IntegratedManipulatorNode(Node):
         self.declare_parameter("ik_tolerance", 5e-3)
         self.declare_parameter("ik_damping", 0.1)
 
-        # SVG Processing Params Detailed Declarations
-        self.declare_parameter(
-            "svg_relative_path",        # Parameter Name (string)
-            "svg_files/VectorizedAbrams.svg" # Default Value (string)
-        )
-        self.declare_parameter(
-            "svg_scale",                # Parameter Name (string)
-            0.0002   # REDACTED/MODIFY   # Default Value (float)
-        )
-        # WHAT: A scaling factor to convert the coordinates *inside* the SVG file
-        #       (which are often unitless or in pixels) into *meters* used by the robot.
-        # HOW:  During the transformation process (`transform_points_to_arm_vertical_plane`),
-        #       the X and Y values read from the SVG path data are multiplied by this number.
-        #       For example, if a line in the SVG goes from (0,0) to (1000, 0) and the scale
-        #       is 0.0001, the corresponding points in meters (before offsetting and mapping
-        #       to robot axes) will be (0,0) and (0.1, 0).
-        # WHY:  SVGs don't have an inherent real-world scale. This parameter lets the user
-        #       control the physical size of the drawing produced by the robot. Adjusting
-        #       this value makes the drawing larger or smaller in the robot's workspace.
-        
-        self.declare_parameter(
-            "svg_x_offset",             # Parameter Name (string)
-            0.150                       # Default Value (float, meters)
-        )
-        self.declare_parameter(
-            "svg_y_offset",             # Parameter Name (string)
-            -0.045                      # Default Value (float, meters)
-        )
-        self.declare_parameter(
-            "svg_z_offset",             # Parameter Name (string)
-            0.30                        # Default Value (float, meters)
-        )
-        self.declare_parameter(
-            "svg_center",               # Parameter Name (string)
-            True                        # Default Value (boolean)
-        )
-        self.declare_parameter(
-            "svg_target_speed",         # Parameter Name (string)
-            0.03                        # Default Value (float, meters per second)
-        )
-        self.declare_parameter(
-            "svg_fixed_roll",           # Parameter Name (string)
-            0.0                         # Default Value (float, radians)
-        )
-        self.declare_parameter(
-            "svg_fixed_pitch",          # Parameter Name (string)
-            0.0                         # Default Value (float, radians)
-        )
-        self.declare_parameter(
-            "svg_fixed_yaw",            # Parameter Name (string)
-            0.0                         # Default Value (float, radians)
-        )
-
         # Timing Params
         self.declare_parameter("start_delay_sec", 2.0)
         self.declare_parameter("time_to_reach_start", 1.0)
         self.declare_parameter("time_to_return_home", 4.0)
+
+        self.declare_parameter("fixed_roll", 0.0)
+        self.declare_parameter("fixed_pitch",  0.0)
+        self.declare_parameter("fixed_yaw", 0.0)
+        self.declare_parameter("target_speed", 0.03)
+
+        self.start_delay_sec = self._get_param("start_delay_sec")
+        self.time_to_reach_start = self._get_param("time_to_reach_start")
+        self.time_to_return_home = self._get_param("time_to_return_home")
+        self.enable_smoothing = self._get_param("enable_cartesian_smoothing")
+        self.smoothing_window = self._get_param("smoothing_window_length")
+        self.smoothing_polyorder = self._get_param("smoothing_polyorder")
+        self.max_joint_velocity = self._get_param("max_joint_velocity")
+        self.min_segment_time = self._get_param("min_segment_time")        
 
         # Read parameters (using self.get_param helper)
         arm_ctrl = self._get_param("arm_controller_name")
@@ -816,36 +683,20 @@ class IntegratedManipulatorNode(Node):
         self.ik_alpha = self._get_param("ik_alpha")
         self.ik_tolerance = self._get_param("ik_tolerance")
         self.ik_damping = self._get_param("ik_damping")
+        self.target_speed = self._get_param("target_speed")
+        self.fixed_rpy = (self._get_param("fixed_roll"),
+                        self._get_param("fixed_pitch"),
+                        self._get_param("fixed_yaw"))
 
-        self.svg_relative_path = self._get_param("svg_relative_path")
-        self.svg_scale = self._get_param("svg_scale")
-        self.svg_x_offset = self._get_param("svg_x_offset")
-        self.svg_y_offset = self._get_param("svg_y_offset")
-        self.svg_z_offset = self._get_param("svg_z_offset")
-        self.svg_center = self._get_param("svg_center")
-        self.svg_target_speed = self._get_param("svg_target_speed")
-        self.svg_fixed_rpy = (self._get_param("svg_fixed_roll"),
-                              self._get_param("svg_fixed_pitch"),
-                              self._get_param("svg_fixed_yaw"))
-        self.start_delay_sec = self._get_param("start_delay_sec")
-        self.time_to_reach_start = self._get_param("time_to_reach_start")
-        self.time_to_return_home = self._get_param("time_to_return_home")
-        self.enable_smoothing = self._get_param("enable_cartesian_smoothing")
-        self.smoothing_window = self._get_param("smoothing_window_length")
-        self.smoothing_polyorder = self._get_param("smoothing_polyorder")
-        self.max_joint_velocity = self._get_param("max_joint_velocity")
-        self.min_segment_time = self._get_param("min_segment_time")
-
-        # Construct absolute SVG path
-        try:
-            self.svg_absolute_path = os.path.join(
-                get_package_share_directory(package_name_for_node), self.svg_relative_path
-            )
-            self.get_logger().info(f"Expecting SVG at: {self.svg_absolute_path}")
-        except Exception as e:
-            self.get_logger().error(f"Could not get SVG path for package '{package_name_for_node}'. Error: {e}")
-            rclpy.try_shutdown()
-            return
+        # --- State Variables ---
+        self.current_joint_angles = None
+        self.joint_state_msg_received = False
+        self.latest_joint_state_msg = None
+        self.trajectory_active = False
+        self.desired_linear_vel = 0.0
+        self.desired_angular_vel = 0.0
+        self._last_generated_traj = None
+        self._open_gripper_timer = None
 
         # --- Kinematics Setup ---
         try:
@@ -871,190 +722,65 @@ class IntegratedManipulatorNode(Node):
              # rclpy.try_shutdown(); return # Don't shutdown, allow it to run partially so cadets can troubleshoot
 
 
-        # --- State Variables ---
-        self.current_joint_angles = None
-        self.joint_state_msg_received = False
-        self.latest_joint_state_msg = None
-        self.trajectory_active = False
-        self.desired_linear_vel = 0.0
-        self.desired_angular_vel = 0.0
-        self._last_generated_traj = None
-        self._open_gripper_timer = None
-
         # --- Publishers ---
         self.arm_publisher = self.create_publisher(JointTrajectory, f"/{arm_ctrl}/joint_trajectory", 10)
-        self._internal_cmd_pub = self.create_publisher(String, '~/internal_command', 10)
-        cmd_vel_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
-        self.cmd_vel_pub_ = self.create_publisher(TwistStamped, f"/{diff_drive_ctrl}/cmd_vel", cmd_vel_qos)
-        self.cmd_vel_msg = TwistStamped()
 
         # --- Subscribers ---
         joint_state_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
         self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, joint_state_qos)
-        self._internal_cmd_sub = self.create_subscription(String, '~/internal_command', self._internal_command_callback, 10)
 
         # --- Action Clients ---
-        self.gripper_client = ActionClient(self, GripperCommand, f'/{gripper_ctrl}/gripper_cmd')
-        if not self.gripper_client.wait_for_server(timeout_sec=3.0): self.get_logger().warn("Gripper action server not available.")
-        else: self.get_logger().info("Gripper action client connected.")
+        # DML Gripper not working for now TODO fix this
+        self.gripper_client = ActionClient(self, GripperCommand, '/gripper_controller/gripper_cmd')
+        if not self.gripper_client.wait_for_server(timeout_sec=2.0): 
+            self.get_logger().warn("Gripper action server not available.")
+        else: 
+            self.get_logger().info("Gripper action client connected.")
 
-        # --- Timers ---
-        self.velocity_publish_timer = self.create_timer(1.0 / self._get_param("velocity_publish_rate"), self.publish_velocity_callback)
-        # Use a one-shot timer to start the process after initial delay and receiving joint states
+        self.get_logger().info("Manipulator Node initialized.")
+
+        # Original code ======
+        # Create action client for follow_joint_trajectory
+        self._action_client = ActionClient(self, FollowJointTrajectory, '/arm_controller/follow_joint_trajectory')
+        self.get_logger().info('Waiting for action server...')
+        server_available = self._action_client.wait_for_server(timeout_sec=10.0)
+        if not server_available:
+            self.get_logger().error('Action server not available after 10 seconds!')
+            return
+        self.get_logger().info('Action server connected!')
+        # Original code ======
+
+        # self._perform_pre_trajectory_actions()
+        
+        # self._execute_trajectory_task()
+        # Move arm to straight up position
         self.initiation_timer = self.create_timer(self.start_delay_sec, self.initiate_trajectory)
+        self.get_logger().info('Done with ArmController init!')
 
-        self.get_logger().info("Integrated Manipulator Node initialized for SVG tracing.")
 
     def initiate_trajectory(self):
-        """Called by timer to start SVG processing if prerequisites are met."""
+        """Called by timer to start processing if prerequisites are met."""
         if self.initiation_timer: self.initiation_timer.cancel() # Cancel this timer
 
         if self.trajectory_active:
-            self.get_logger().info("SVG trajectory already active or completed.")
+            self.get_logger().info("trajectory already active or completed.")
             return
 
         if not self.joint_state_msg_received or self.current_joint_angles is None:
-            self.get_logger().warn("Joint states not ready. Retrying SVG trajectory initiation in 5s.")
+            self.get_logger().warn("Joint states not ready. Retrying trajectory initiation in 5s.")
             # Reschedule the check
             self.initiation_timer = self.create_timer(5.0, self.initiate_trajectory)
             return
 
-
-    def _get_param(self, name):
-        """Helper to get parameter value."""
-        return self.get_parameter(name).value
-
-    
-    def joint_state_callback(self, msg: JointState):
-        """Stores the latest joint states needed for IK and initial state capture."""
-        self.latest_joint_state_msg = msg # Store the whole message
-
-        if self.trajectory_active:
-             # Maybe add a log here if needed for debugging state updates
-             # self.get_logger().debug("Trajectory active, not updating current_joint_angles seed from joint_state.")
-             pass # Don't update the seed while a trajectory is planned/running
-
-        # Check if ik_joint_names is available (might fail during init if get_chain was redacted/failed)
-        if not hasattr(self, 'ik_joint_names') or not self.ik_joint_names:
-            if not self.joint_state_msg_received: # Log once
-                self.get_logger().warn("IK joint names not available (kinematics setup might have failed). Cannot process joint states.")
-            self.joint_state_msg_received = True # Prevent repeated logging
-            return
-
-        required = set(self.ik_joint_names)
-        available = set(msg.name)
-        if not required.issubset(available):
-            if not self.joint_state_msg_received: # Log once
-                 self.get_logger().warn(f"Waiting for joint states. Missing: {required - available}")
-            return
-
-        current_states = {name: pos for name, pos in zip(msg.name, msg.position)}
-        try:
-            # Extract angles in the specific order needed by IK for seeding
-            current_ik_angles = np.array([current_states[name] for name in self.ik_joint_names])
-
-            # Only update the 'live' seed if trajectory isn't active
-            if not self.trajectory_active:
-                self.current_joint_angles = current_ik_angles
-
-            if not self.joint_state_msg_received:
-                self.get_logger().info(f"Received first joint states (IK order): {np.round(current_ik_angles, 3)}")
-            self.joint_state_msg_received = True
-        except KeyError as e:
-             self.get_logger().error(f"Error extracting joint state for '{e}'.")
-             self.current_joint_angles = None
-             self.joint_state_msg_received = False
-
-    def initiate_svg_trajectory(self):
-        """Called by timer to start SVG processing if prerequisites are met."""
-        if self.initiation_timer: self.initiation_timer.cancel() # Cancel this timer
-
-        if self.trajectory_active:
-            self.get_logger().info("SVG trajectory already active or completed.")
-            return
-
-        if not self.joint_state_msg_received or self.current_joint_angles is None:
-            self.get_logger().warn("Joint states not ready. Retrying SVG trajectory initiation in 5s.")
-            # Reschedule the check
-            self.initiation_timer = self.create_timer(5.0, self.initiate_svg_trajectory)
-            return
-
         # Add a check to see if kinematics setup likely failed
         if not hasattr(self, 'robot') or not hasattr(self, 'ik_joint_names'):
-            self.get_logger().error("Kinematics (URDF/chain) not properly initialized. Cannot start SVG trajectory.")
+            self.get_logger().error("Kinematics (URDF/chain) not properly initialized. Cannot start trajectory.")
             self.trajectory_active = False # Ensure flag is false
             return
 
-        self.get_logger().info("Prerequisites met. Starting SVG trajectory generation...")
-        self.generate_and_send_svg_trajectory()
+        self.get_logger().info("Prerequisites met. Starting trajectory generation...")
+        self.generate_and_send_trajectory()
 
-    def generate_and_send_svg_trajectory(self):
-        """Starts the SVG trajectory generation in a separate thread."""
-        if self.trajectory_active:
-            self.get_logger().warn("Trajectory generation already active. Ignoring request.")
-            return
-
-        self.trajectory_active = True
-        self.get_logger().info("Starting SVG trajectory task in background thread...")
-        thread = threading.Thread(target=self._execute_svg_trajectory_task, daemon=True)
-        thread.start()
-
-    # --- Helper Methods for _execute_svg_trajectory_task ---
-    def _wait_for_ros_and_joints(self):
-        """Waits for rclpy context and initial joint states."""
-        loop_count = 0
-        while not rclpy.ok() and loop_count < 100: # Timeout after ~10s
-            if loop_count == 0: print("Waiting for rclpy context...")
-            time.sleep(0.1); loop_count += 1
-        if not rclpy.ok(): print("ERROR: Timed out waiting for rclpy context!"); return False
-        self.get_logger().info("rclpy context ok.")
-        time.sleep(0.5) # Extra safety pause
-
-        max_wait = 5.0; waited_time = 0.0; wait_interval = 0.1
-        while self.current_joint_angles is None and waited_time < max_wait:
-            self.get_logger().warn(f"Waiting for initial joint angles... ({waited_time:.1f}s)")
-            time.sleep(wait_interval); waited_time += wait_interval
-        if self.current_joint_angles is None:
-             self.get_logger().error("Failed to get initial joint angles. Aborting task.")
-             return False
-        return True
-
-    def _load_and_transform_svg(self):
-        """Loads SVG, parses paths, and transforms points."""
-        try:
-            self.get_logger().info(f"Parsing SVG: {self.svg_absolute_path}")
-            points2D, listOfpaths2D = parse_svg_file_robust(self.svg_absolute_path)
-
-            if listOfpaths2D: # Optional plotting
-                try:
-                    self.get_logger().info("Plotting extracted SVG paths (blocking)...")
-                    plot_svg_paths(listOfpaths2D, self.svg_absolute_path)
-                except Exception as plot_err:
-                     self.get_logger().warn(f"Plotting failed (display might not be available): {plot_err}")
-            else:
-                self.get_logger().warn("No paths extracted or plotting failed.")
-
-            if not points2D:
-                self.get_logger().error(f"SVG file parsing failed or returned no points: {self.svg_absolute_path}")
-                return None
-
-            self.get_logger().info(f"Transforming {len(points2D)} SVG points to 3D...")
-            points3D = transform_points_to_arm_vertical_plane(
-                points2D, self.svg_scale, self.svg_x_offset,
-                self.svg_y_offset, self.svg_z_offset, self.svg_center
-            )
-            if not points3D:
-                 self.get_logger().error("Failed to transform SVG points to 3D.")
-                 return None
-            self.get_logger().error(f"\n\npoints3D: {points3D}.\n")
-            
-            return points3D
-        except FileNotFoundError:
-            self.get_logger().error(f"SVG file not found at {self.svg_absolute_path}.")
-            return None
-        except Exception as e:
-            self.get_logger().error(f"Error during SVG processing: {e}\n{traceback.format_exc()}")
-            return None
 
     # --- Helper for Smoothing ---
     def _smooth_cartesian_path(self, points_3d):
@@ -1093,39 +819,29 @@ class IntegratedManipulatorNode(Node):
             self.get_logger().error(f"Error during Savitzky-Golay smoothing: {e}")
             return points_3d
 
-    # --- Helper to plot comparison...see how well they are overlaid---
-    def _plot_smoothed_vs_raw(self, raw_points, smoothed_points):
-        try:
-            fig = plt.figure(figsize=(12, 6))
 
-            # Plot YZ projection (since X is fixed)
-            ax1 = fig.add_subplot(121)
-            raw_np = np.array(raw_points)
-            smooth_np = np.array(smoothed_points)
-            ax1.plot(raw_np[:, 1], raw_np[:, 2], 'r.-', label='Raw', markersize=4, alpha=0.7)
-            ax1.plot(smooth_np[:, 1], smooth_np[:, 2], 'b.-', label='Smoothed', markersize=2)
-            ax1.set_xlabel("Y (m)")
-            ax1.set_ylabel("Z (m)")
-            ax1.set_title("Smoothed vs Raw (YZ Plane)")
-            ax1.legend()
-            ax1.grid(True)
-            ax1.invert_yaxis() # Match SVG coords if needed
-            ax1.set_aspect('equal', adjustable='box')
+    def generate_and_send_trajectory(self):
+        """Starts the trajectory generation in a separate thread."""
+        if self.trajectory_active:
+            self.get_logger().warn("Trajectory generation already active. Ignoring request.")
+            return
 
-            # Plot Z coordinate vs point index
-            ax2 = fig.add_subplot(122)
-            ax2.plot(raw_np[:, 2], 'r.-', label='Raw Z', alpha=0.7)
-            ax2.plot(smooth_np[:, 2], 'b.-', label='Smoothed Z')
-            ax2.set_xlabel("Point Index")
-            ax2.set_ylabel("Z Coordinate (m)")
-            ax2.set_title("Z Coordinate Smoothing")
-            ax2.legend()
-            ax2.grid(True)
+        self.trajectory_active = True
+        self.get_logger().info("Starting trajectory task in background thread...")
+        thread = self._execute_trajectory_task()
 
-            plt.tight_layout()
-            plt.show()
-        except Exception as plot_err:
-            self.get_logger().warn(f"Plotting smoothed vs raw failed: {plot_err}")
+    def _get_param(self, name):
+        """Helper to get parameter value."""
+        return self.get_parameter(name).value
+
+    def _perform_pre_trajectory_actions(self):
+        """Handles gripper actions before starting the arm movement."""
+        self.get_logger().info("Performing pre-trajectory gripper sequence...")
+        self.send_gripper_goal(self.gripper_closed_pos); time.sleep(1.0) # Close (alert)
+        self.send_gripper_goal(self.gripper_open_pos); time.sleep(1.5)   # Open
+        self.get_logger().info(f"*/*//*/*/*//*/*/* Insert laser now... */*//*/*/*//*/*/*")
+        self.send_gripper_goal(self.gripper_closed_pos); time.sleep(1.5) # Close (hold)
+        self.get_logger().info("Pre-trajectory sequence complete.")
 
 
     def _calculate_ik_and_build_trajectory(self,
@@ -1137,7 +853,7 @@ class IntegratedManipulatorNode(Node):
         Calculates IK for 3D points, builds the JointTrajectory message with
         refined timing based on Cartesian and joint speeds, and adds estimated velocities.
         """
-        target_poses_T = [homogeneous_transform(pt, self.svg_fixed_rpy) for pt in points3D]
+        target_poses_T = [homogeneous_transform(pt, self.fixed_rpy) for pt in points3D]
         num_targets = len(target_poses_T)
         self.get_logger().info(f"Generated {num_targets} target poses.")
 
@@ -1214,7 +930,7 @@ class IntegratedManipulatorNode(Node):
                 # --- Timing Calculation ---
                 distance = np.linalg.norm(current_target_point_3d - last_target_point_3d)
                 total_distance += distance
-                time_cartesian = (distance / self.svg_target_speed) if self.svg_target_speed > 1e-6 else self.min_segment_time
+                time_cartesian = (distance / self.target_speed) if self.target_speed > 1e-6 else self.min_segment_time
 
                 delta_q = ik_solution - last_sent_joint_angles_ik
                 max_joint_change = 0.0
@@ -1294,20 +1010,29 @@ class IntegratedManipulatorNode(Node):
              self.get_logger().warn("Trajectory contains fewer than 2 points. Movement might be trivial or jerky.")
 
         return traj, current_time_from_start, total_distance
+    
+    # --- Helper Methods for _execute_trajectory_task ---
+    def _wait_for_ros_and_joints(self):
+        """Waits for rclpy context and initial joint states."""
+        loop_count = 0
+        while not rclpy.ok() and loop_count < 100: # Timeout after ~10s
+            if loop_count == 0: print("Waiting for rclpy context...")
+            time.sleep(0.1); loop_count += 1
+        if not rclpy.ok(): print("ERROR: Timed out waiting for rclpy context!"); return False
+        self.get_logger().info("rclpy context ok.")
+        time.sleep(0.5) # Extra safety pause
 
-
-    def _perform_pre_trajectory_actions(self):
-        """Handles gripper actions before starting the arm movement."""
-        self.get_logger().info("Performing pre-trajectory gripper sequence...")
-        self.send_gripper_goal(self.gripper_closed_pos); time.sleep(1.0) # Close (alert)
-        self.send_gripper_goal(self.gripper_open_pos); time.sleep(1.5)   # Open
-        self.get_logger().info(f"*/*//*/*/*//*/*/* Insert laser now... */*//*/*/*//*/*/*")
-        self.send_gripper_goal(self.gripper_closed_pos); time.sleep(1.5) # Close (hold)
-        self.get_logger().info("Pre-trajectory sequence complete.")
+        max_wait = 5.0; waited_time = 0.0; wait_interval = 0.1
+        while self.current_joint_angles is None and waited_time < max_wait:
+            self.get_logger().warn(f"Waiting for initial joint angles... ({waited_time:.1f}s)")
+            time.sleep(wait_interval); waited_time += wait_interval
+        if self.current_joint_angles is None:
+             self.get_logger().error("Failed to get initial joint angles. Aborting task.")
+             return False
+        return True    
 
     # --- Main Task Execution (Runs in Thread) ---
-    def _execute_svg_trajectory_task(self):
-        """Orchestrates the entire SVG tracing process in a background thread."""
+    def _execute_trajectory_task(self):
         if not self._wait_for_ros_and_joints():
             self.trajectory_active = False; return
 
@@ -1337,18 +1062,12 @@ class IntegratedManipulatorNode(Node):
             self.get_logger().error(f"Error capturing initial joint states: {e}\n{traceback.format_exc()}")
             self.trajectory_active = False
             return
-
-        # --- Start Main Logic ---
+        
         try:
-            # 1. Start Spinning Wheels (via internal command)
-            self.safe_publish_velocity(0.0, self.spin_angular_vel)
-            time.sleep(0.1)
+            # 1. Skipped
 
-            # 2. Load SVG and Transform Points
-            points3D_raw = self._load_and_transform_svg()
-            if points3D_raw is None:
-                self.safe_publish_velocity(0.0, 0.0)
-                self.trajectory_active = False; return
+            # 2. Load Points
+            points3D_raw = self.load_points(self.points_file)
 
             # 2b. Smooth the Cartesian Path
             if self.enable_smoothing and SCIPY_AVAILABLE:
@@ -1359,8 +1078,6 @@ class IntegratedManipulatorNode(Node):
                 points3D = points3D_raw
 
             if not points3D:
-                 self.get_logger().error("Point list is empty after optional smoothing. Aborting.")
-                 self.safe_publish_velocity(0.0, 0.0)
                  self.trajectory_active = False; return
 
             # 3. Calculate IK and Build Trajectory
@@ -1371,7 +1088,6 @@ class IntegratedManipulatorNode(Node):
             )
             if traj is None:
                 self.get_logger().error("Failed to calculate trajectory (check IK solver/kinematics).")
-                self.safe_publish_velocity(0.0, 0.0)
                 self.trajectory_active = False; return
 
             self.get_logger().info(f"Generated final trajectory with {len(traj.points)} points.")
@@ -1381,130 +1097,181 @@ class IntegratedManipulatorNode(Node):
             # 4. Pre-Trajectory Actions (Gripper)
             self._perform_pre_trajectory_actions()
 
-            # 5. Stop Spinning Wheels
-            self.get_logger().info("Stopping wheels before arm trajectory.")
-            self.safe_publish_velocity(0.0, 0.0)
+            # 5. NOT NEEDED: Stop Spinning Wheels
             time.sleep(0.1)
 
             # 6. Publish Trajectory (via internal command)
             self.get_logger().info("Requesting trajectory publish via internal topic...")
             self._last_generated_traj = traj
-            self._publish_internal_command({"action": "publish_trajectory"})
+            if self._last_generated_traj and self.arm_publisher:
+                    self.arm_publisher.publish(self._last_generated_traj)
+                    self._last_generated_traj = None
+            else: self.get_logger().error("No trajectory data or arm publisher for internal command.")
 
             # 7. Schedule Post-Trajectory Actions (via internal command)
-            delay = total_time + 2.0 # Add buffer time
-            self.get_logger().info(f"Requesting scheduling of final actions after {delay:.2f}s.")
-            self._publish_internal_command({"action": "schedule_final_timer", "delay": delay})
-            self.get_logger().info("Background trajectory task completed initiation.")
+            # delay = total_time + 2.0 # Add buffer time
+            # self.get_logger().info(f"Requesting scheduling of final actions after {delay:.2f}s.")
+            # self._publish_internal_command({"action": "schedule_final_timer", "delay": delay})
+            # self.get_logger().info("Background trajectory task completed initiation.")
 
         except Exception as e:
              self.get_logger().error(f"Unhandled exception in trajectory task thread: {e}\n{traceback.format_exc()}")
-             try: self.safe_publish_velocity(0.0, 0.0)
-             except Exception as e2: self.get_logger().error(f"Failed to stop wheels during exception handling: {e2}")
-             self.trajectory_active = False
+            #  try: self.safe_publish_velocity(0.0, 0.0)
+        except Exception as e2: 
+            self.get_logger().error(f"Failed to stop wheels during exception handling: {e2}")
+            self.trajectory_active = False
 
-    # --- Internal Command Handling ---
-    def _publish_internal_command(self, command_dict):
-        """Helper to publish commands to the internal topic."""
-        try:
-            msg = String(data=json.dumps(command_dict))
-            if hasattr(self, '_internal_cmd_pub') and self._internal_cmd_pub:
-                self._internal_cmd_pub.publish(msg)
-            else: self.get_logger().error("Internal command publisher not available!")
-        except Exception as e:
-            self.get_logger().error(f"Failed to publish internal command {command_dict}: {e}\n{traceback.format_exc()}")
 
-    def _internal_command_callback(self, msg: String):
-        """Handles commands received on the internal topic (runs in executor thread)."""
-        try:
-            cmd = json.loads(msg.data)
-            action = cmd.get("action")
 
-            if action == "publish_velocity":
-                linear_x = cmd.get("linear_x", 0.0); angular_z = cmd.get("angular_z", 0.0)
-                # self.get_logger().info(f"Exec internal: Publish Velocity ({linear_x:.2f}, {angular_z:.2f})") # Debug
-                self.desired_linear_vel = float(linear_x)
-                self.desired_angular_vel = float(angular_z)
-                # self._publish_velocity_now()
 
-            elif action == "publish_trajectory":
-                self.get_logger().info("Exec internal: Publish Trajectory")
-                if self._last_generated_traj and self.arm_publisher:
-                     self.arm_publisher.publish(self._last_generated_traj)
-                     self._last_generated_traj = None
-                else: self.get_logger().error("No trajectory data or arm publisher for internal command.")
 
-            elif action == "schedule_final_timer":
-                 delay = cmd.get("delay")
-                 if delay is not None:
-                      self.get_logger().info(f"Exec internal: Schedule Timer (delay={delay:.2f})")
-                      self._schedule_final_actions(float(delay))
-                 else: self.get_logger().error("Delay missing for schedule_final_timer cmd.")
 
-            else: self.get_logger().warn(f"Unknown internal command action: {action}")
 
-        except json.JSONDecodeError: self.get_logger().error(f"Failed to decode internal command JSON: {msg.data}")
-        except Exception as e: self.get_logger().error(f"Error processing internal command: {e}\n{traceback.format_exc()}")
+    def joint_state_callback(self, msg: JointState):
+        """Stores the latest joint states needed for IK and initial state capture."""
+        self.latest_joint_state_msg = msg # Store the whole message
 
-    # --- Velocity Control Helpers ---
-    def safe_publish_velocity(self, linear_x, angular_z):
-        """Requests immediate velocity publish via the internal command topic."""
-        # self.get_logger().info(f"Requesting internal velocity publish: lin={linear_x:.2f}, ang={angular_z:.2f}") # Debug
-        self._publish_internal_command({
-            "action": "publish_velocity",
-            "linear_x": linear_x,
-            "angular_z": angular_z
-        })
+        if self.trajectory_active:
+             # Maybe add a log here if needed for debugging state updates
+             # self.get_logger().debug("Trajectory active, not updating current_joint_angles seed from joint_state.")
+             pass # Don't update the seed while a trajectory is planned/running
 
-    def _publish_velocity_now(self):
-        """Publishes the current desired velocity immediately (must run in executor)."""
-        if not hasattr(self, 'cmd_vel_pub_') or self.cmd_vel_pub_ is None:
-            self.get_logger().warn("Velocity publisher not ready for immediate publish.", throttle_duration_sec=5)
+        # Check if ik_joint_names is available (might fail during init if get_chain was redacted/failed)
+        if not hasattr(self, 'ik_joint_names') or not self.ik_joint_names:
+            if not self.joint_state_msg_received: # Log once
+                self.get_logger().warn("IK joint names not available (kinematics setup might have failed). Cannot process joint states.")
+            self.joint_state_msg_received = True # Prevent repeated logging
             return
+
+        required = set(self.ik_joint_names)
+        available = set(msg.name)
+        if not required.issubset(available):
+            if not self.joint_state_msg_received: # Log once
+                 self.get_logger().warn(f"Waiting for joint states. Missing: {required - available}")
+            return
+
+        current_states = {name: pos for name, pos in zip(msg.name, msg.position)}
         try:
-            self.cmd_vel_msg.header.stamp = self.get_clock().now().to_msg()
-            self.cmd_vel_msg.header.frame_id = self.base_link
-            self.cmd_vel_msg.twist.linear.x = self.desired_linear_vel
-            self.cmd_vel_msg.twist.angular.z = self.desired_angular_vel
-            self.cmd_vel_msg.twist.linear.y = 0.0; self.cmd_vel_msg.twist.linear.z = 0.0
-            self.cmd_vel_msg.twist.angular.x = 0.0; self.cmd_vel_msg.twist.angular.y = 0.0
-            self.cmd_vel_pub_.publish(self.cmd_vel_msg)
-        except Exception as e:
-            self.get_logger().error(f"Failed immediate velocity publish: {e}", exc_info=True)
+            # Extract angles in the specific order needed by IK for seeding
+            current_ik_angles = np.array([current_states[name] for name in self.ik_joint_names])
 
-    def publish_velocity_callback(self):
-        """Called by timer to continuously publish the *desired* velocity."""
-        self._publish_velocity_now()
+            # Only update the 'live' seed if trajectory isn't active
+            if not self.trajectory_active:
+                self.current_joint_angles = current_ik_angles
 
-    # --- Final Actions Scheduling and Callback ---
-    def _schedule_final_actions(self, delay):
-        """Creates the timer for final actions (runs in executor thread)."""
-        self.get_logger().info(f"Creating final action timer with delay {delay:.2f}s.")
-        if self._open_gripper_timer:
-            try: self._open_gripper_timer.cancel()
-            except Exception as e: self.get_logger().warn(f"Exception cancelling previous timer: {e}")
-        try:
-            self._open_gripper_timer = self.create_timer(delay, self._final_actions_callback)
-            self.get_logger().info("Final action timer created.")
-        except Exception as e:
-            self.get_logger().error(f"Failed to create final action timer: {e}", exc_info=True)
+            if not self.joint_state_msg_received:
+                self.get_logger().info(f"Received first joint states (IK order): {np.round(current_ik_angles, 3)}")
+            self.joint_state_msg_received = True
+        except KeyError as e:
+             self.get_logger().error(f"Error extracting joint state for '{e}'.")
+             self.current_joint_angles = None
+             self.joint_state_msg_received = False    
 
-    def _final_actions_callback(self):
-        """Callback for final actions after trajectory completion."""
-        self.get_logger().info("Final action timer expired. Opening gripper and resuming spin.")
-        self.send_gripper_goal(self.gripper_open_pos) # Open gripper
+    def move_arm_stow(self):
+        """Move the OpenManipulator arm to straight up position using action"""
+        
+        # Create goal message
+        goal_msg = FollowJointTrajectory.Goal()
+        
+        # Create JointTrajectory
+        trajectory = JointTrajectory()
+        
+        # Joint names for OpenManipulator
+        trajectory.joint_names = self.joint_names
+        
+        # Create trajectory point for straight up position
+        point = JointTrajectoryPoint()
+        point.positions = [0.0, -1.05, 1.07, 0.0]
 
-        # Resume Spinning by setting desired state (timer will publish)
-        self.desired_linear_vel = 0.0
-        self.desired_angular_vel = self.spin_angular_vel
-
-        if self._open_gripper_timer:
-             try: self._open_gripper_timer.cancel()
-             except Exception as e: self.get_logger().warn(f"Exception cancelling final action timer: {e}")
-             self._open_gripper_timer = None
-        self.trajectory_active = False
-        self.get_logger().info("SVG tracing process considered complete.")
-
+        # Time to reach this position (2 seconds)
+        point.time_from_start = Duration(sec=2, nanosec=0)
+        
+        # Add point to trajectory
+        trajectory.points.append(point)
+        
+        # Set trajectory in goal
+        goal_msg.trajectory = trajectory
+        
+        # Send goal
+        self.get_logger().info('Sending goal to move arm straight up...')
+        self.get_logger().info(f'Target positions: {point.positions}')
+        
+        self._send_goal_future = self._action_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.feedback_callback
+        )
+        self._send_goal_future.add_done_callback(self.goal_response_callback)
+        
+    def move_arm(self, joint_angles=[0.0, -1.05, 1.07, 0.0], duration=Duration(sec=2, nanosec=0)):
+        """Move the OpenManipulator arm to straight up position using action"""
+        
+        # Create goal message
+        goal_msg = FollowJointTrajectory.Goal()
+        
+        # Create JointTrajectory
+        trajectory = JointTrajectory()
+        
+        # Joint names for OpenManipulator
+        trajectory.joint_names = self.joint_names
+        
+        # Create trajectory point for straight up position
+        point = JointTrajectoryPoint()
+        point.positions = joint_angles
+        
+        # Time to reach this position (2 seconds)
+        point.time_from_start = duration
+        
+        # Add point to trajectory
+        trajectory.points.append(point)
+        
+        # Set trajectory in goal
+        goal_msg.trajectory = trajectory
+        
+        # Send goal
+        self.get_logger().info('Sending goal to move arm straight up...')
+        self.get_logger().info(f'Target positions: {point.positions}')
+        
+        self._send_goal_future = self._action_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.feedback_callback
+        )
+        self._send_goal_future.add_done_callback(self.goal_response_callback)
+        
+    def goal_response_callback(self, future):
+        """Callback for when goal is accepted or rejected"""
+        goal_handle = future.result()
+        
+        if not goal_handle.accepted:
+            self.get_logger().error('Goal rejected by action server')
+            return
+            
+        self.get_logger().info('Goal accepted! Executing trajectory...')
+        
+        # Get result
+        self._get_result_future = goal_handle.get_result_async()
+        self._get_result_future.add_done_callback(self.get_result_callback)
+        
+    def feedback_callback(self, feedback_msg):
+        """Callback for trajectory execution feedback"""
+        feedback = feedback_msg.feedback
+        
+        # Log current joint positions if available
+        if hasattr(feedback, 'actual') and len(feedback.actual.positions) > 0:
+            positions = [f"{p:.3f}" for p in feedback.actual.positions]
+            self.get_logger().info(f'Current positions: {positions}', throttle_duration_sec=0.5)
+        
+    def get_result_callback(self, future):
+        """Callback for final result"""
+        result = future.result().result
+        
+        if result.error_code == FollowJointTrajectory.Result.SUCCESSFUL:
+            self.get_logger().info('✓ Arm successfully moved to straight up position!')
+        else:
+            self.get_logger().error(
+                f'✗ Trajectory execution failed with error code: {result.error_code}'
+            )
+            if result.error_string:
+                self.get_logger().error(f'Error string: {result.error_string}')
 
     # --- Gripper Action Goal Sender ---
     def send_gripper_goal(self, position, max_effort=0.0):
@@ -1544,62 +1311,37 @@ class IntegratedManipulatorNode(Node):
         except Exception as e:
              self.get_logger().error(f"Exception getting gripper result: {e}")
 
-    # --- Node cleanup ---
-    def destroy_node(self):
-        self.get_logger().info("Destroying node...")
-        if hasattr(self, 'velocity_publish_timer') and self.velocity_publish_timer: self.velocity_publish_timer.cancel()
-        if hasattr(self, '_open_gripper_timer') and self._open_gripper_timer: self._open_gripper_timer.cancel()
-        if hasattr(self, 'initiation_timer') and self.initiation_timer: self.initiation_timer.cancel()
-        if hasattr(self, 'cmd_vel_pub_') and self.cmd_vel_pub_ and rclpy.ok():
-            try:
-                stop_msg = TwistStamped()
-                stop_msg.header.stamp = self.get_clock().now().to_msg()
-                stop_msg.header.frame_id = self.base_link
-                self.cmd_vel_pub_.publish(stop_msg)
-                self.get_logger().info("Sent stop command to wheels.")
-                time.sleep(0.1)
-            except Exception as e:
-                self.get_logger().warn(f"Could not send stop command on shutdown: {e}")
-        super().destroy_node()
-        self.get_logger().info("Node destroyed.")
+    def load_points(self, filename):
+        file_path = filename
+        print(f'{file_path}')
+        lines_list_stripped = []
+        points=[]
+        with open(file_path, 'r') as file:
+            lines_list_stripped = [line.rstrip() for line in file]
+        for line in lines_list_stripped:
+            item_list = line.strip().split(',')
+            float_list = [float(x) for x in item_list if x]
+            points.append(tuple(float_list))
+        return points
 
-# --- Main function ---
+
 def main(args=None):
     rclpy.init(args=args)
-    node = None
-    executor = None
+    
+    controller = ArmController()
+    
     try:
-        print("Creating IntegratedManipulatorNode...")
-        node = IntegratedManipulatorNode()
-        if node and rclpy.ok():
-             print("Node created. Creating MultiThreadedExecutor...")
-             executor = MultiThreadedExecutor()
-             executor.add_node(node)
-             print(f"Node '{node.get_name()}' added. Spinning executor...")
-             executor.spin()
-        else:
-             print("Node initialization failed or shutdown requested early.")
+        # Keep node alive to receive callbacks
+        rclpy.spin(controller)
 
-    except KeyboardInterrupt: print("Keyboard interrupt received.")
-    except ExternalShutdownException: print("External shutdown request received.")
-    except Exception as e: print(f"Unhandled exception in main: {e}\n{traceback.format_exc()}")
+    except KeyboardInterrupt:
+        controller.move_arm_stow()
+        controller.get_logger().info('Shutting down...')
     finally:
-        print("Executing finally block...")
-        if executor:
-            print("Shutting down executor...")
-            executor.shutdown()
-            print("Executor shutdown complete.")
-        # Ensure node destruction happens *after* executor shutdown if possible
-        if node:
-            print("Destroying node...")
-            try: node.destroy_node()
-            except Exception as e: print(f"Error during node destruction: {e}")
-            print("Node destruction finished.")
-
         if rclpy.ok():
-            print("Shutting down rclpy...")
+            controller.destroy_node()
             rclpy.shutdown()
-        print("Shutdown complete.")
+
 
 if __name__ == '__main__':
     main()

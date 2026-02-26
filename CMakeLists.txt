@@ -16,10 +16,7 @@ include_directories(include)
 add_executable(scan_monitor src/scan_monitor.cpp)
 ament_target_dependencies(scan_monitor rclcpp sensor_msgs)
 
-install(TARGETS
-  scan_monitor
-  DESTINATION lib/${PROJECT_NAME}
-)
+
 
 ament_python_install_package(${PROJECT_NAME})
 
@@ -29,6 +26,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
     DESTINATION share/${PROJECT_NAME}
     PATTERN "setup_assistant.launch" EXCLUDE)
 endif()
+
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME}
+)
 
 file(GLOB PYTHON_SCRIPTS "ee484_projects/*.py")
 
