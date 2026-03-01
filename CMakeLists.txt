@@ -10,6 +10,8 @@ find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(control_msgs REQUIRED)
+find_package(moveit_msgs REQUIRED)
 
 include_directories(include)
 
@@ -17,8 +19,19 @@ add_executable(scan_monitor src/scan_monitor.cpp)
 ament_target_dependencies(scan_monitor rclcpp sensor_msgs)
 
 
+# Keyboard control example for servo
+add_executable(servo_keyboard_input src/servo_keyboard_input.cpp)
+target_include_directories(servo_keyboard_input PUBLIC include)
+ament_target_dependencies(servo_keyboard_input rclcpp control_msgs moveit_msgs)
 
 ament_python_install_package(${PROJECT_NAME})
+
+install(DIRECTORY include/
+  DESTINATION include
+)
+
+install(TARGETS servo_keyboard_input DESTINATION lib/${PROJECT_NAME})
+
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
   install(
